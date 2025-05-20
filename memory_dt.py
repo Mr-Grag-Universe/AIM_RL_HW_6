@@ -88,7 +88,7 @@ class POMDPDataset(Dataset):
         actions = torch.tensor(self.actions[idx:done_idx], dtype=torch.long).unsqueeze(1)
         rtgs = torch.tensor(self.rtgs[idx:done_idx], dtype=torch.float32).unsqueeze(1)
         timesteps = torch.tensor(self.timesteps[idx:idx+1], dtype=torch.int64).unsqueeze(1)
-        
+
         return states, actions, rtgs, timesteps
 
 
@@ -131,26 +131,85 @@ class MemoryDecisionTransformer(nn.Module):
         # Memory module (optional)
         if memory_type == 'gru':
             # TODO: Implement GRU memory
-            self.memory_proj = nn.Linear(memory_dim, n_embed)
+            self.bidir = False
+            self.mem_dropout = dropout
+            self.mem_n_layer = n_layer
+
+            self.memory_proj = nn.Linear((2**self.bidir)*memory_dim, n_embed)
+            self.memory = nn.GRU(n_embed, memory_dim, num_layers=self.mem_n_layer,
+                                 batch_first=True, dropout=self.mem_dropout, 
+                                 bidirectional=self.bidir)
         elif memory_type == 'lstm':
             # TODO: Implement LSTM memory
-            self.memory_proj = nn.Linear(memory_dim, n_embed)
+            self.bidir = False
+            self.mem_dropout = dropout
+            self.mem_n_layer = n_layer
+
+            self.memory_proj = nn.Linear((2**self.bidir)*memory_dim, n_embed)
+            self.memory = nn.LSTM(n_embed, memory_dim, num_layers=self.mem_n_layer,
+                                  batch_first=True, dropout=self.mem_dropout, 
+                                  bidirectional=self.bidir)
+        elif memory_type == 'transformer':
+            # число слотов памяти; пока хардкод
+            self.n_memory_slots = self.context_length
+            self.memory_dim = memory_dim
+            # размерность запросов q и ключей k
+            self.att_dim = 64
+
+            self.memory = True
+            
+            # attention
+            self.W_q_w = torch.nn.parameter.Parameter(torch.randn(memory_dim, self.att_dim))
+            self.W_k_w = torch.nn.parameter.Parameter(torch.randn(3*n_embed, self.att_dim))
+
+            self.W_q_b = torch.nn.parameter.Parameter(torch.randn(memory_dim, self.att_dim))
+            self.W_k_b = torch.nn.parameter.Parameter(torch.randn(3*n_embed, self.att_dim))
+            self.W_v_b = torch.nn.parameter.Parameter(torch.randn(1, 3*n_embed, self.att_dim))
+
+            self.memory_proj = nn.Linear(self.memory_dim, 3*n_embed)
+        elif memory_type == 'SHM':
+            self.memory = True
+            self.memory_dim = memory_dim
+
+            self.q = nn.Linear(3*n_embed, memory_dim)
+            self.v = nn.Linear(3*n_embed, memory_dim)
+            self.k = nn.Linear(3*n_embed, memory_dim)
+            self.eta = nn.Sequential(nn.Linear(3*n_embed, 1), nn.Sigmoid())
+            self.v_c = nn.Linear(3*n_embed, memory_dim)
+            self.theta = nn.parameter.Parameter(torch.randn(memory_dim, memory_dim) / self.memory_dim**0.5)
+
+            # инициализация
+            nn.init.xavier_normal_(self.q.weight, gain=0.1)
+            nn.init.xavier_normal_(self.v.weight, gain=0.1)
+            nn.init.xavier_normal_(self.v_c.weight, gain=0.1)
+            nn.init.xavier_normal_(self.k.weight, gain=0.1)
+            nn.init.xavier_normal_(self.eta[0].weight, gain=0.1)
         else:
             self.memory = None
         
+        d_model = None
+        if memory_type == 'transformer':
+            d_model = 3*self.n_embed
+        elif memory_type == 'SHM':
+            d_model = self.n_embed
+        else:
+            d_model = n_embed
         # Transformer
         transformer_layer = nn.TransformerEncoderLayer(
-            d_model=n_embed,
+            d_model=d_model,
             nhead=n_head,
             dim_feedforward=4*n_embed,
             dropout=dropout,
             batch_first=True
         )
         self.transformer = nn.TransformerEncoder(transformer_layer, n_layer)
-        
+
         # action head
-        self.action_head = nn.Linear(n_embed, n_actions)
-        
+        if memory_type == 'transformer':
+            self.action_head = nn.Linear(3*n_embed, n_actions)
+        else:
+            self.action_head = nn.Linear(n_embed, n_actions)
+
         self.hidden_state = None
     
     def reset_memory(self):
@@ -176,29 +235,48 @@ class MemoryDecisionTransformer(nn.Module):
         if rtgs.dim() == 2:
             rtgs = rtgs.unsqueeze(-1)
         
+        # print(states, actions, rtgs)
         # encoding inputs
         state_embeddings = self.state_encoder(states)
         action_embeddings = self.action_encoder(actions)
         return_embeddings = self.return_encoder(rtgs)
+        # print("input: ", state_embeddings[0,0,0], action_embeddings[0,0,0], return_embeddings[0,0,0])
+
+        device = state_embeddings.device
         
         # add memory
         if self.memory is not None:
             if self.memory_type == 'gru':
                 if self.hidden_state is None:
                     # TODO: Implement GRU memory
+                    self.hidden_state = torch.zeros((2**int(self.bidir))*self.mem_n_layer, batch_size, self.n_embed, 
+                                                    device=device, dtype=state_embeddings.dtype)
                 
                 memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
             elif self.memory_type == 'lstm':
                 if self.hidden_state is None:
                     # TODO: Implement LSTM memory
+                    h = torch.zeros((2**int(self.bidir))*self.mem_n_layer, batch_size, self.memory.hidden_size, 
+                                    device=device, dtype=state_embeddings.dtype)
+                    c = torch.zeros((2**int(self.bidir))*self.mem_n_layer, batch_size, self.memory.hidden_size, 
+                                    device=device, dtype=state_embeddings.dtype)
+                    self.hidden_state = (h.detach(), c.detach())
                 
                 memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
-            
-            # project memory to embedding dimension
-            memory_embedding = self.memory_proj(memory_out)
-            
-            # combine memory with state embeddings
-            state_embeddings = state_embeddings + memory_embedding
+
+            if self.memory_type == 'transformer':
+                if self.hidden_state is None:
+                    self.hidden_state = torch.zeros(batch_size, self.context_length, self.memory_dim, 
+                                                    device=device, dtype=state_embeddings.dtype)
+            elif self.memory_type == 'SHM':
+                if self.hidden_state is None:
+                    self.hidden_state = torch.zeros(batch_size, self.memory_dim, self.memory_dim, 
+                                                    device=device, dtype=state_embeddings.dtype)
+            else:
+                # project memory to embedding dimension
+                memory_embedding = self.memory_proj(memory_out)
+                # combine memory with state embeddings
+                state_embeddings = state_embeddings + memory_embedding
         
         # prepare sequence for transformer (R_t, o_t, a_t)
         sequence = torch.cat([
@@ -206,10 +284,92 @@ class MemoryDecisionTransformer(nn.Module):
             state_embeddings,
             action_embeddings
         ], dim=1)
-        
+        # print(state_embeddings.shape, sequence.shape)
+
         # add positional encoding
         sequence = self.pos_encoder(sequence)
-        
+
+        if self.memory_type == 'transformer':
+            E = torch.cat([
+                state_embeddings,
+                action_embeddings,
+                return_embeddings
+            ], dim=-1)
+
+            Q_b = self.hidden_state @ self.W_q_b
+            # print("Q: ", Q_b.shape)
+            K_b = E @ self.W_k_b
+            # print("K: ", K_b.shape)
+            beta = torch.softmax(Q_b @ K_b.permute(0, 2, 1) / np.sqrt(self.att_dim), dim=-1)
+            # print("beta: ", beta.shape)
+
+            Q_w = self.hidden_state @ self.W_q_w
+            K_w = E @ self.W_k_w
+            w = torch.softmax(Q_w @ K_w.permute(0, 2, 1) / np.sqrt(self.att_dim), dim=-1)
+            # print("w: ", w.shape)
+
+            e_e = w * (1-beta)
+            e_e = torch.nn.functional.pad(e_e, (0, self.hidden_state.shape[-1]-seq_length), mode='constant', value=0)
+            # print("e_e: ", e_e.shape)
+
+            # print(w.shape, self.W_v_b.shape, E.shape)
+            e_a = (w * beta) @ (E @ self.W_v_b)
+            # print("e_a: ", e_a.shape)
+
+            # print(self.hidden_state.shape, e_e.shape, e_a.shape)
+            self.hidden_state = self.hidden_state * (1-e_e) + e_a
+            # print("M: ", self.hidden_state.shape)
+
+            w = torch.nn.functional.pad(w, (0, self.context_length-seq_length), mode='constant', value=1)
+            # print(w.shape, self.hidden_state.shape)
+            mem_add = self.memory_proj(w * self.hidden_state[:,:])
+            # print("2: ", E.shape, mem_add.shape)
+            sequence = E + mem_add[:,:E.shape[1]]
+            # print(sequence.shape, w.shape, self.hidden_state.shape)
+        elif self.memory_type == 'SHM':
+            E = torch.cat([
+                state_embeddings,
+                action_embeddings,
+                return_embeddings
+            ], dim=-1)
+            # print("E: ", E.shape, E[0,0,0])
+
+            B = batch_size
+            L = seq_length
+            # theta = self.theta[torch.randint(0, self.theta.size(0))]
+            inds = torch.randint(0, self.theta.size(0), (B, L))
+            theta = self.theta[inds]
+            # print("theta shape: ", theta.shape)
+
+            v = torch.nn.functional.layer_norm(self.v(E), [self.memory_dim])
+            k = torch.nn.functional.layer_norm(self.k(E), [self.memory_dim])
+            vc = torch.nn.functional.layer_norm(self.v_c(E), [self.memory_dim])
+
+            # print("U...", self.eta(E).shape, self.v(E).shape, self.k(E).shape)
+            U = self.eta(E).unsqueeze(-1) * torch.einsum("blj, blk -> bljk", v, k)
+            # print("C...")
+            C = 1 + torch.tanh(torch.einsum("blj, blk -> bljk", theta, vc))
+            # print("Q...")
+            Q = torch.nn.functional.layer_norm(self.q(E), [self.memory_dim])
+            # print("U, C, Q: ", U.shape, C.shape, Q.shape)
+
+            # отнормируем
+            # C = torch.nn.functional.layer_norm(C)
+
+            E_out = torch.empty(batch_size, seq_length, self.memory_dim, 
+                                device=device, dtype=state_embeddings.dtype)
+            for i in range(L):
+                # print(i)
+                self.hidden_state = self.hidden_state * C[:,i] + U[:,i]
+                self.hidden_state = torch.nn.functional.layer_norm(self.hidden_state, 
+                                                                   [self.memory_dim, self.memory_dim])
+                # print("M, q: ", self.hidden_state.shape, Q[:,i,:].T.shape)
+                h = torch.einsum('bij,bj->bi', self.hidden_state, Q[:,i])
+                # print("h: ", h.shape)
+                E_out[:,i] = h
+            sequence = torch.nn.functional.layer_norm(E_out, [self.memory_dim])
+        # print("sequance: ", sequence.shape,  sequence[0,0,0])
+
         # apply transformer
         # create causal attention mask
         seq_len = sequence.size(1)
@@ -218,6 +378,7 @@ class MemoryDecisionTransformer(nn.Module):
             diagonal=1
         )
         
+        # print("applying transformer...")
         # try different mask parameter names for compatibility across PyTorch versions
         try:
             transformer_outputs = self.transformer(sequence, mask=mask)
@@ -227,12 +388,21 @@ class MemoryDecisionTransformer(nn.Module):
             except TypeError:
                 # fall back to no mask if neither works
                 transformer_outputs = self.transformer(sequence)
+        # print(transformer_outputs)
         
         # extract state positions for output
-        state_positions = transformer_outputs[:, seq_length:2*seq_length]
-        
+        if self.memory_type == 'transformer':
+            state_positions = transformer_outputs[:, :seq_length]
+        elif self.memory_type == 'SHM':
+            state_positions = transformer_outputs
+        else:
+            state_positions = transformer_outputs[:, seq_length:2*seq_length]
+        # print(state_positions)
+
         # predict actions
         action_preds = self.action_head(state_positions)
+
+        # print(action_preds)
         
         return action_preds
     
@@ -271,7 +441,9 @@ class MemoryDecisionTransformer(nn.Module):
         
         # forward pass
         with torch.no_grad():
+            # print(states.shape, actions.shape, rtgs.shape)
             action_preds = self.forward(states, actions, rtgs)
+            # print(action_preds.shape)
             action = torch.argmax(action_preds[0, -1]).item()
         
         return action
@@ -280,7 +452,7 @@ class MemoryDecisionTransformer(nn.Module):
 def train_memory_dt(
         env_name, dataset_path, n_epochs=10, batch_size=64, context_length=20,
         n_embed=128, n_layer=2, n_head=4, memory_type='gru', memory_dim=64,
-        learning_rate=1e-4, weight_decay=1e-4, debug=False
+        learning_rate=1e-4, weight_decay=1e-4, debug=False, patience=5
     ):
     """Train a Memory-enabled Decision Transformer."""
     
@@ -343,7 +515,7 @@ def train_memory_dt(
     train_losses, val_losses, val_returns = [], [], []
     best_val_return = float('-inf')
     best_model_state = None
-    patience, patience_counter = 5, 0
+    patience, patience_counter = patience, 0
     
     for epoch in range(n_epochs):
         # TRAIN PHASE
@@ -367,10 +539,12 @@ def train_memory_dt(
             
             action_preds = model(states, actions, rtgs)
             
+            # print(actions[0], '\n', action_preds[0])
             loss = criterion(
                 action_preds.reshape(-1, dataset.vocab_size),
                 actions.reshape(-1)
             )
+            # print("loss: ", loss)
             
             optimizer.zero_grad()
             loss.backward()
