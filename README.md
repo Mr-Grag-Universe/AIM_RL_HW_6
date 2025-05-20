@@ -1,6 +1,10 @@
 # Advanced Reinforcement Learning Course @ AI Masters
 ## Homework 6: Decision Transformer with Memory
 
+Кафанов Степан
+
+Решение приведено в файле solution.ipynb. Изменения вносились только в него и в memory_dt.py.
+
 ### Introduction
 
 Decision Transformer (DT) is a powerful algorithm for Offline Reinforcement Learning with significant flexibility for modifications. One common approach is adding memory mechanisms to enhance its capabilities (https://arxiv.org/abs/2306.09459, https://arxiv.org/abs/2305.16338, https://arxiv.org/abs/2410.07071, https://openreview.net/forum?id=NHMuM84tRT).
